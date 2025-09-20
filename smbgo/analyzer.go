@@ -36,6 +36,24 @@ type moduleInfo struct {
 	packages []string
 }
 
+var builtinIdentifierCandidates = []string{
+	"append",
+	"cap",
+	"close",
+	"complex",
+	"copy",
+	"delete",
+	"imag",
+	"len",
+	"make",
+	"new",
+	"panic",
+	"print",
+	"println",
+	"real",
+	"recover",
+}
+
 func run(pass *analysis.Pass) (any, error) {
 	state := &analyzerState{
 		pass:        pass,
@@ -272,6 +290,13 @@ func collectIdentifierPool(pass *analysis.Pass) []string {
 			}
 			seen[name] = struct{}{}
 		}
+	}
+
+	for _, name := range builtinIdentifierCandidates {
+		if name == "" {
+			continue
+		}
+		seen[name] = struct{}{}
 	}
 
 	result := make([]string, 0, len(seen))
