@@ -36,24 +36,6 @@ type moduleInfo struct {
 	packages []string
 }
 
-var builtinIdentifierCandidates = []string{
-	"append",
-	"cap",
-	"close",
-	"complex",
-	"copy",
-	"delete",
-	"imag",
-	"len",
-	"make",
-	"new",
-	"panic",
-	"print",
-	"println",
-	"real",
-	"recover",
-}
-
 func run(pass *analysis.Pass) (any, error) {
 	state := &analyzerState{
 		pass:        pass,
@@ -292,8 +274,9 @@ func collectIdentifierPool(pass *analysis.Pass) []string {
 		}
 	}
 
-	for _, name := range builtinIdentifierCandidates {
-		if name == "" {
+	universe := types.Universe
+	for _, name := range universe.Names() {
+		if name == "" || name == "_" {
 			continue
 		}
 		seen[name] = struct{}{}
