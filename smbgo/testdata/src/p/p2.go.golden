@@ -1,0 +1,7 @@
+package p
+
+var saveRef int
+
+func useIdentifier() {
+	_ = saveRef // want "undefined identifier"
+}
