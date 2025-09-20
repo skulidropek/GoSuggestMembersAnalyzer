@@ -27,7 +27,7 @@ var Analyzer = &analysis.Analyzer{
 type analyzerState struct {
 	pass        *analysis.Pass
 	moduleCache map[string]*moduleInfo
-	identPool   []string
+	identPool   []suggestion
 }
 
 type moduleInfo struct {
@@ -36,11 +36,34 @@ type moduleInfo struct {
 	packages []string
 }
 
+type suggestion struct {
+	Name  string
+	Label string
+}
+
+var builtinSignatures = map[string]string{
+	"append":  "append(slice []T, elems ...T) []T",
+	"cap":     "cap(v Capable) int",
+	"close":   "close(c chan<- T)",
+	"complex": "complex(r, i FloatType) ComplexType",
+	"copy":    "copy(dst, src []T) int",
+	"delete":  "delete(m map[K]V, key K)",
+	"imag":    "imag(c ComplexType) FloatType",
+	"len":     "len(v LengthCapable) int",
+	"make":    "make(t Type, size ...int) Type",
+	"new":     "new(T) *T",
+	"panic":   "panic(v any)",
+	"print":   "print(args ...any)",
+	"println": "println(args ...any)",
+	"real":    "real(c ComplexType) FloatType",
+	"recover": "recover() any",
+}
+
 func run(pass *analysis.Pass) (any, error) {
 	state := &analyzerState{
 		pass:        pass,
 		moduleCache: make(map[string]*moduleInfo),
-		identPool:   collectIdentifierPool(pass),
+		identPool:   collectIdentifierSuggestions(pass),
 	}
 
 	for _, file := range pass.Files {
@@ -100,7 +123,7 @@ func (s *analyzerState) handleSelector(sel *ast.SelectorExpr) {
 			if pkg == nil {
 				return
 			}
-			members := collectPackageMembers(pkg)
+			members := collectPackageMembers(pkg, types.RelativeTo(s.pass.Pkg))
 			candidates := topSimilar(name, members, maxSelectorDistance(name), 5)
 			if len(candidates) == 0 {
 				return
@@ -120,7 +143,7 @@ func (s *analyzerState) handleSelector(sel *ast.SelectorExpr) {
 		return
 	}
 
-	candidates := similarMembers(name, xType)
+	candidates := similarMembers(name, xType, s.pass.Pkg)
 	if len(candidates) == 0 {
 		return
 	}
@@ -215,7 +238,12 @@ func (s *analyzerState) handleImport(spec *ast.ImportSpec, filename string) {
 		return
 	}
 
-	message := fmt.Sprintf("cannot resolve import %q; did you mean:%s", raw, formatCandidates(candidates))
+	importSuggestions := make([]suggestion, len(candidates))
+	for i, cand := range candidates {
+		importSuggestions[i] = suggestion{Name: cand, Label: cand}
+	}
+
+	message := fmt.Sprintf("cannot resolve import %q; did you mean:%s", raw, formatCandidates(importSuggestions))
 
 	s.pass.Report(analysis.Diagnostic{
 		Pos:     spec.Path.Pos(),
@@ -240,82 +268,243 @@ func (s *analyzerState) moduleInfoForFile(filename string) *moduleInfo {
 	return info
 }
 
-func collectIdentifierPool(pass *analysis.Pass) []string {
-	seen := make(map[string]struct{})
+func collectIdentifierSuggestions(pass *analysis.Pass) []suggestion {
+	qualifier := types.RelativeTo(pass.Pkg)
+	seen := make(map[string]string)
+
+	add := func(name, label string) {
+		if name == "" || name == "_" {
+			return
+		}
+		if label == "" {
+			label = name
+		}
+		if existing, ok := seen[name]; !ok || len(label) > len(existing) {
+			seen[name] = label
+		}
+	}
 
 	for ident, obj := range pass.TypesInfo.Defs {
 		if obj == nil {
 			continue
 		}
-		name := ident.Name
-		if name == "" || name == "_" {
-			continue
-		}
-		seen[name] = struct{}{}
+		add(ident.Name, describeObject(obj, qualifier))
 	}
 
 	for ident, obj := range pass.TypesInfo.Uses {
 		if obj == nil {
 			continue
 		}
-		name := ident.Name
-		if name == "" || name == "_" {
-			continue
-		}
-		seen[name] = struct{}{}
+		add(ident.Name, describeObject(obj, qualifier))
 	}
 
 	if pass.Pkg != nil {
-		for _, name := range pass.Pkg.Scope().Names() {
-			if name == "" || name == "_" {
-				continue
-			}
-			seen[name] = struct{}{}
+		scope := pass.Pkg.Scope()
+		for _, name := range scope.Names() {
+			add(name, describeObject(scope.Lookup(name), qualifier))
 		}
 	}
 
 	universe := types.Universe
 	for _, name := range universe.Names() {
-		if name == "" || name == "_" {
-			continue
-		}
-		seen[name] = struct{}{}
+		add(name, describeObject(universe.Lookup(name), qualifier))
 	}
 
-	result := make([]string, 0, len(seen))
-	for name := range seen {
-		result = append(result, name)
+	result := make([]suggestion, 0, len(seen))
+	for name, label := range seen {
+		result = append(result, suggestion{Name: name, Label: label})
 	}
-	sort.Strings(result)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
 	return result
 }
 
-func similarMembers(name string, typ types.Type) []string {
-	members := collectMembers(typ)
+func describeObject(obj types.Object, qualifier types.Qualifier) string {
+	if obj == nil {
+		return ""
+	}
+
+	name := obj.Name()
+	if name == "" {
+		return ""
+	}
+
+	typ := obj.Type()
+	switch specific := obj.(type) {
+	case *types.Func:
+		if sig, ok := typ.(*types.Signature); ok {
+			return formatFunctionLabel(name, sig, qualifier)
+		}
+	case *types.Var:
+		typeStr := ""
+		if typ != nil {
+			typeStr = types.TypeString(typ, qualifier)
+		}
+		if typeStr != "" {
+			return fmt.Sprintf("%s %s", name, typeStr)
+		}
+	case *types.Const:
+		if typ != nil {
+			return fmt.Sprintf("%s %s", name, types.TypeString(typ, qualifier))
+		}
+	case *types.TypeName:
+		if typ != nil {
+			underlying := typ
+			if named, ok := typ.(*types.Named); ok {
+				underlying = named.Underlying()
+			}
+			if specific.IsAlias() {
+				return fmt.Sprintf("%s = %s", name, types.TypeString(underlying, qualifier))
+			}
+			return fmt.Sprintf("%s %s", name, types.TypeString(underlying, qualifier))
+		}
+	case *types.Builtin:
+		if label, ok := builtinSignatures[name]; ok {
+			return label
+		}
+		if sig, ok := typ.(*types.Signature); ok {
+			return formatFunctionLabel(name, sig, qualifier)
+		}
+		if typ != nil {
+			typeStr := types.TypeString(typ, qualifier)
+			if typeStr != "" && typeStr != name {
+				return fmt.Sprintf("%s %s", name, typeStr)
+			}
+		}
+	}
+
+	if typ != nil {
+		return fmt.Sprintf("%s %s", name, types.TypeString(typ, qualifier))
+	}
+	return name
+}
+
+func formatFunctionLabel(name string, sig *types.Signature, qualifier types.Qualifier) string {
+	var b strings.Builder
+	if recv := sig.Recv(); recv != nil {
+		recvType := types.TypeString(recv.Type(), qualifier)
+		b.WriteString("(")
+		if recv.Name() != "" {
+			b.WriteString(recv.Name())
+			b.WriteString(" ")
+		}
+		b.WriteString(recvType)
+		b.WriteString(").")
+	}
+
+	b.WriteString(name)
+	b.WriteString("(")
+	b.WriteString(formatParameters(sig.Params(), sig.Variadic(), qualifier))
+	b.WriteString(")")
+
+	if res := formatResults(sig.Results(), qualifier); res != "" {
+		b.WriteString(" ")
+		b.WriteString(res)
+	}
+
+	return b.String()
+}
+
+func formatParameters(tuple *types.Tuple, variadic bool, qualifier types.Qualifier) string {
+	if tuple == nil || tuple.Len() == 0 {
+		return ""
+	}
+	parts := make([]string, 0, tuple.Len())
+	for i := 0; i < tuple.Len(); i++ {
+		v := tuple.At(i)
+		if v == nil {
+			continue
+		}
+		typ := v.Type()
+		typeStr := ""
+		if typ != nil {
+			typeStr = types.TypeString(typ, qualifier)
+		}
+		if variadic && i == tuple.Len()-1 {
+			if slice, ok := typ.(*types.Slice); ok {
+				typeStr = "..." + types.TypeString(slice.Elem(), qualifier)
+			}
+		}
+		if v.Name() != "" {
+			parts = append(parts, fmt.Sprintf("%s %s", v.Name(), typeStr))
+		} else {
+			parts = append(parts, typeStr)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatResults(tuple *types.Tuple, qualifier types.Qualifier) string {
+	if tuple == nil || tuple.Len() == 0 {
+		return ""
+	}
+	if tuple.Len() == 1 && tuple.At(0).Name() == "" {
+		return types.TypeString(tuple.At(0).Type(), qualifier)
+	}
+	parts := make([]string, 0, tuple.Len())
+	for i := 0; i < tuple.Len(); i++ {
+		v := tuple.At(i)
+		if v == nil {
+			continue
+		}
+		typeStr := types.TypeString(v.Type(), qualifier)
+		if v.Name() != "" {
+			parts = append(parts, fmt.Sprintf("%s %s", v.Name(), typeStr))
+		} else {
+			parts = append(parts, typeStr)
+		}
+	}
+	return fmt.Sprintf("(%s)", strings.Join(parts, ", "))
+}
+
+func similarMembers(name string, typ types.Type, pkg *types.Package) []suggestion {
+	members := collectMembers(typ, types.RelativeTo(pkg))
 	return topSimilar(name, members, maxSelectorDistance(name), 5)
 }
 
-func collectPackageMembers(pkg *types.Package) []string {
+func collectPackageMembers(pkg *types.Package, qualifier types.Qualifier) []suggestion {
 	scope := pkg.Scope()
 	names := scope.Names()
-	out := make([]string, 0, len(names))
+	lookup := func(name string) suggestion {
+		obj := scope.Lookup(name)
+		label := describeObject(obj, qualifier)
+		return suggestion{Name: name, Label: label}
+	}
+
+	result := make([]suggestion, 0, len(names))
+	seen := make(map[string]suggestion)
 	for _, name := range names {
-		if ast.IsExported(name) {
-			out = append(out, name)
+		if !ast.IsExported(name) {
+			continue
+		}
+		sugg := lookup(name)
+		if existing, ok := seen[sugg.Name]; !ok || len(sugg.Label) > len(existing.Label) {
+			seen[sugg.Name] = sugg
 		}
 	}
-	sort.Strings(out)
-	return out
+	for _, sugg := range seen {
+		result = append(result, sugg)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result
 }
 
-func collectMembers(t types.Type) []string {
-	names := make(map[string]struct{})
+func collectMembers(t types.Type, qualifier types.Qualifier) []suggestion {
+	entries := make(map[string]suggestion)
 
-	add := func(name string) {
+	add := func(name, label string) {
 		if name == "" {
 			return
 		}
-		names[name] = struct{}{}
+		if label == "" {
+			label = name
+		}
+		if existing, ok := entries[name]; !ok || len(label) > len(existing.Label) {
+			entries[name] = suggestion{Name: name, Label: label}
+		}
 	}
 
 	base := t
@@ -325,37 +514,51 @@ func collectMembers(t types.Type) []string {
 
 	if st, ok := base.Underlying().(*types.Struct); ok {
 		for i := 0; i < st.NumFields(); i++ {
-			add(st.Field(i).Name())
+			field := st.Field(i)
+			name := field.Name()
+			if name == "" {
+				continue
+			}
+			label := fmt.Sprintf("%s %s", name, types.TypeString(field.Type(), qualifier))
+			add(name, label)
 		}
 	}
 
 	addMethodSet := func(typ types.Type) {
 		ms := types.NewMethodSet(typ)
 		for i := 0; i < ms.Len(); i++ {
-			add(ms.At(i).Obj().Name())
+			obj := ms.At(i).Obj()
+			name := obj.Name()
+			if name == "" {
+				continue
+			}
+			label := describeObject(obj, qualifier)
+			add(name, label)
 		}
 	}
 
 	addMethodSet(t)
 	addMethodSet(types.NewPointer(base))
 
-	result := make([]string, 0, len(names))
-	for name := range names {
-		result = append(result, name)
+	result := make([]suggestion, 0, len(entries))
+	for _, sugg := range entries {
+		result = append(result, sugg)
 	}
-	sort.Strings(result)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
 	return result
 }
 
-func topSimilar(target string, pool []string, maxDist, limit int) []string {
+func topSimilar(target string, pool []suggestion, maxDist, limit int) []suggestion {
 	if target == "" || limit <= 0 {
 		return nil
 	}
 
 	type candidate struct {
-		value string
-		dist  int
-		size  int
+		suggestion suggestion
+		dist       int
+		size       int
 	}
 
 	targetLower := strings.ToLower(target)
@@ -363,23 +566,24 @@ func topSimilar(target string, pool []string, maxDist, limit int) []string {
 	seen := make(map[string]struct{})
 
 	for _, option := range pool {
-		if option == "" {
+		if option.Name == "" {
 			continue
 		}
-		if _, ok := seen[option]; ok {
+		lowerName := strings.ToLower(option.Name)
+		if _, ok := seen[lowerName]; ok {
 			continue
 		}
-		seen[option] = struct{}{}
+		seen[lowerName] = struct{}{}
 
-		if strings.EqualFold(option, target) {
+		if lowerName == targetLower {
 			continue
 		}
 
-		dist := editDistance(targetLower, strings.ToLower(option))
+		dist := editDistance(targetLower, lowerName)
 		if dist > maxDist {
 			continue
 		}
-		candidates = append(candidates, candidate{value: option, dist: dist, size: len(option)})
+		candidates = append(candidates, candidate{suggestion: option, dist: dist, size: len(option.Name)})
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
@@ -389,16 +593,16 @@ func topSimilar(target string, pool []string, maxDist, limit int) []string {
 		if candidates[i].size != candidates[j].size {
 			return candidates[i].size < candidates[j].size
 		}
-		return candidates[i].value < candidates[j].value
+		return candidates[i].suggestion.Name < candidates[j].suggestion.Name
 	})
 
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
 
-	result := make([]string, len(candidates))
+	result := make([]suggestion, len(candidates))
 	for i, cand := range candidates {
-		result[i] = cand.value
+		result[i] = cand.suggestion
 	}
 	return result
 }
@@ -530,14 +734,18 @@ func collectModulePackages(root, modPath string) []string {
 	return result
 }
 
-func formatCandidates(candidates []string) string {
+func formatCandidates(candidates []suggestion) string {
 	if len(candidates) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	for _, cand := range candidates {
 		b.WriteString("\n  - ")
-		b.WriteString(cand)
+		label := cand.Label
+		if label == "" {
+			label = cand.Name
+		}
+		b.WriteString(label)
 	}
 	return b.String()
 }
