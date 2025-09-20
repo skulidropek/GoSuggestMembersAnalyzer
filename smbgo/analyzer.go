@@ -89,13 +89,34 @@ func (s *analyzerState) handleSelector(sel *ast.SelectorExpr) {
 		return
 	}
 
-	xType := s.pass.TypesInfo.TypeOf(sel.X)
-	if xType == nil {
+	name := sel.Sel.Name
+	if name == "" {
 		return
 	}
 
-	name := sel.Sel.Name
-	if name == "" {
+	if ident, ok := sel.X.(*ast.Ident); ok {
+		if pkgName, ok := s.pass.TypesInfo.Uses[ident].(*types.PkgName); ok && pkgName != nil {
+			pkg := pkgName.Imported()
+			if pkg == nil {
+				return
+			}
+			members := collectPackageMembers(pkg)
+			candidates := topSimilar(name, members, maxSelectorDistance(name), 5)
+			if len(candidates) == 0 {
+				return
+			}
+			message := fmt.Sprintf("unknown selector %q in package %s; did you mean:%s", name, pkg.Path(), formatCandidates(candidates))
+			s.pass.Report(analysis.Diagnostic{
+				Pos:     sel.Sel.Pos(),
+				End:     sel.Sel.End(),
+				Message: message,
+			})
+			return
+		}
+	}
+
+	xType := s.pass.TypesInfo.TypeOf(sel.X)
+	if xType == nil {
 		return
 	}
 
@@ -264,6 +285,19 @@ func collectIdentifierPool(pass *analysis.Pass) []string {
 func similarMembers(name string, typ types.Type) []string {
 	members := collectMembers(typ)
 	return topSimilar(name, members, maxSelectorDistance(name), 5)
+}
+
+func collectPackageMembers(pkg *types.Package) []string {
+	scope := pkg.Scope()
+	names := scope.Names()
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if ast.IsExported(name) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func collectMembers(t types.Type) []string {
