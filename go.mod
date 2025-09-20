@@ -1,4 +1,4 @@
-module github.com/you/smbgo
+module github.com/skulidropek/GoSuggestMembersAnalyzer
 
 go 1.24.4
 

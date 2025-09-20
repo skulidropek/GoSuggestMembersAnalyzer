@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/you/smbgo/smbgo"
+	"github.com/skulidropek/GoSuggestMembersAnalyzer/smbgo"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
