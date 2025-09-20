@@ -1,8 +1,13 @@
 package smbgo
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
+	"go/build"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"go/types"
 	"io/fs"
 	"os"
@@ -11,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis"
@@ -41,23 +47,10 @@ type suggestion struct {
 	Label string
 }
 
-var builtinSignatures = map[string]string{
-	"append":  "append(slice []T, elems ...T) []T",
-	"cap":     "cap(v Capable) int",
-	"close":   "close(c chan<- T)",
-	"complex": "complex(r, i FloatType) ComplexType",
-	"copy":    "copy(dst, src []T) int",
-	"delete":  "delete(m map[K]V, key K)",
-	"imag":    "imag(c ComplexType) FloatType",
-	"len":     "len(v LengthCapable) int",
-	"make":    "make(t Type, size ...int) Type",
-	"new":     "new(T) *T",
-	"panic":   "panic(v any)",
-	"print":   "print(args ...any)",
-	"println": "println(args ...any)",
-	"real":    "real(c ComplexType) FloatType",
-	"recover": "recover() any",
-}
+var (
+	builtinSigOnce    sync.Once
+	builtinSignatures map[string]string
+)
 
 func run(pass *analysis.Pass) (any, error) {
 	state := &analyzerState{
@@ -320,6 +313,56 @@ func collectIdentifierSuggestions(pass *analysis.Pass) []suggestion {
 	return result
 }
 
+func builtinLabel(name string) string {
+	builtinSigOnce.Do(loadBuiltinSignatures)
+	if builtinSignatures == nil {
+		return ""
+	}
+	return builtinSignatures[name]
+}
+
+func loadBuiltinSignatures() {
+	info, err := build.Default.Import("builtin", "", build.FindOnly)
+	if err != nil {
+		return
+	}
+	entries := make(map[string]string)
+	fset := token.NewFileSet()
+
+	files, err := os.ReadDir(info.Dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range files {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+
+		path := filepath.Join(info.Dir, entry.Name())
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			continue
+		}
+
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Name == nil {
+				continue
+			}
+			var buf bytes.Buffer
+			if err := format.Node(&buf, fset, fn.Type); err != nil {
+				continue
+			}
+			sig := strings.TrimPrefix(buf.String(), "func")
+			label := fn.Name.Name + sig
+			entries[fn.Name.Name] = strings.TrimSpace(label)
+		}
+	}
+
+	builtinSignatures = entries
+}
+
 func describeObject(obj types.Object, qualifier types.Qualifier) string {
 	if obj == nil {
 		return ""
@@ -360,7 +403,7 @@ func describeObject(obj types.Object, qualifier types.Qualifier) string {
 			return fmt.Sprintf("%s %s", name, types.TypeString(underlying, qualifier))
 		}
 	case *types.Builtin:
-		if label, ok := builtinSignatures[name]; ok {
+		if label := builtinLabel(name); label != "" {
 			return label
 		}
 		if sig, ok := typ.(*types.Signature); ok {
