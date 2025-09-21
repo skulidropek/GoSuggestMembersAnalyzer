@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis"
@@ -117,7 +119,7 @@ func (s *analyzerState) handleSelector(sel *ast.SelectorExpr) {
 				return
 			}
 			members := collectPackageMembers(pkg, types.RelativeTo(s.pass.Pkg))
-			candidates := topSimilar(name, members, maxSelectorDistance(name), 5)
+			candidates := topSimilar(name, members, 5)
 			if len(candidates) == 0 {
 				return
 			}
@@ -183,7 +185,7 @@ func (s *analyzerState) handleIdent(id *ast.Ident, parent ast.Node) {
 		}
 	}
 
-	candidates := topSimilar(id.Name, s.identPool, maxIdentifierDistance(id.Name), 5)
+	candidates := topSimilar(id.Name, s.identPool, 5)
 	if len(candidates) == 0 {
 		return
 	}
@@ -503,7 +505,7 @@ func formatResults(tuple *types.Tuple, qualifier types.Qualifier) string {
 
 func similarMembers(name string, typ types.Type, pkg *types.Package) []suggestion {
 	members := collectMembers(typ, types.RelativeTo(pkg))
-	return topSimilar(name, members, maxSelectorDistance(name), 5)
+	return topSimilar(name, members, 5)
 }
 
 func collectPackageMembers(pkg *types.Package, qualifier types.Qualifier) []suggestion {
@@ -593,48 +595,43 @@ func collectMembers(t types.Type, qualifier types.Qualifier) []suggestion {
 	return result
 }
 
-func topSimilar(target string, pool []suggestion, maxDist, limit int) []suggestion {
+func topSimilar(target string, pool []suggestion, limit int) []suggestion {
 	if target == "" || limit <= 0 {
 		return nil
 	}
 
 	type candidate struct {
 		suggestion suggestion
-		dist       int
-		size       int
+		score      float64
 	}
 
 	targetLower := strings.ToLower(target)
-	var candidates []candidate
 	seen := make(map[string]struct{})
+	var candidates []candidate
 
 	for _, option := range pool {
 		if option.Name == "" {
 			continue
 		}
 		lowerName := strings.ToLower(option.Name)
+		if lowerName == targetLower {
+			continue
+		}
 		if _, ok := seen[lowerName]; ok {
 			continue
 		}
 		seen[lowerName] = struct{}{}
 
-		if lowerName == targetLower {
+		score := compositeScore(target, option.Name)
+		if score < 0.3 {
 			continue
 		}
-
-		dist := editDistance(targetLower, lowerName)
-		if dist > maxDist {
-			continue
-		}
-		candidates = append(candidates, candidate{suggestion: option, dist: dist, size: len(option.Name)})
+		candidates = append(candidates, candidate{suggestion: option, score: score})
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].dist != candidates[j].dist {
-			return candidates[i].dist < candidates[j].dist
-		}
-		if candidates[i].size != candidates[j].size {
-			return candidates[i].size < candidates[j].size
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
 		}
 		return candidates[i].suggestion.Name < candidates[j].suggestion.Name
 	})
@@ -656,16 +653,19 @@ func similarImportPaths(target string, pool []string, limit int) []string {
 	}
 
 	type candidate struct {
-		value    string
-		baseDist int
-		fullDist int
+		value string
+		score float64
 	}
 
-	targetLower := strings.ToLower(target)
-	targetBase := strings.ToLower(path.Base(target))
+	base := baseWithoutExt(target)
+	normBase := normalizeString(base)
+	minScore := 0.35
+	if len(normBase) >= 10 {
+		minScore = 0.33
+	}
 
-	var candidates []candidate
 	seen := make(map[string]struct{})
+	var candidates []candidate
 
 	for _, option := range pool {
 		if option == "" {
@@ -680,23 +680,21 @@ func similarImportPaths(target string, pool []string, limit int) []string {
 		}
 		seen[lower] = struct{}{}
 
-		base := strings.ToLower(path.Base(option))
-		baseDist := editDistance(targetBase, base)
-		fullDist := editDistance(targetLower, lower)
-
-		if baseDist > 3 && fullDist > 4 {
+		scoreFull := compositeScore(target, option)
+		scoreBase := compositeScore(base, baseWithoutExt(option))
+		score := scoreFull
+		if scoreBase > score {
+			score = scoreBase
+		}
+		if score < minScore {
 			continue
 		}
-
-		candidates = append(candidates, candidate{value: option, baseDist: baseDist, fullDist: fullDist})
+		candidates = append(candidates, candidate{value: option, score: score})
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].baseDist != candidates[j].baseDist {
-			return candidates[i].baseDist < candidates[j].baseDist
-		}
-		if candidates[i].fullDist != candidates[j].fullDist {
-			return candidates[i].fullDist < candidates[j].fullDist
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
 		}
 		return candidates[i].value < candidates[j].value
 	})
@@ -710,6 +708,239 @@ func similarImportPaths(target string, pool []string, limit int) []string {
 		result[i] = cand.value
 	}
 	return result
+}
+
+func baseWithoutExt(p string) string {
+	if p == "" {
+		return ""
+	}
+	base := path.Base(p)
+	ext := path.Ext(base)
+	if ext == "" {
+		return base
+	}
+	return base[:len(base)-len(ext)]
+}
+
+func compositeScore(unknown, candidate string) float64 {
+	A := normalizeString(unknown)
+	B := normalizeString(candidate)
+	jw := jaroWinkler(A, B)
+	tok := jaccardTokens(unknown, candidate)
+	cont := 0.0
+	if len(A) > 0 && len(B) > 0 && (strings.Contains(A, B) || strings.Contains(B, A)) {
+		cont = 1.0
+	}
+	pref := float64(longestCommonPrefix(A, B))
+	if pref > 4 {
+		pref = 4
+	}
+	pref /= 4.0
+	baseScore := 0.5*jw + 0.3*tok + 0.1*cont + 0.1*pref
+	lengthDiff := float64(len(candidate) - len(unknown))
+	if lengthDiff < 0 {
+		lengthDiff = 0
+	}
+	lengthPenalty := math.Min(0.15, lengthDiff*0.01)
+	s := baseScore - lengthPenalty
+	if s <= 0 {
+		return 0
+	}
+	if s >= 1 {
+		return 1
+	}
+	return s
+}
+
+func normalizeString(str string) string {
+	if str == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(str))
+	for _, r := range str {
+		switch r {
+		case '_', ' ', '.', '/', '-':
+			continue
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+func splitIdentifier(identifier string) []string {
+	runes := []rune(identifier)
+	if len(runes) == 0 {
+		return nil
+	}
+	var parts []string
+	start := 0
+	flush := func(end int) {
+		if end <= start {
+			return
+		}
+		segment := strings.ToLower(string(runes[start:end]))
+		if segment != "" {
+			parts = append(parts, segment)
+		}
+	}
+
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if unicode.IsSpace(r) || r == '_' || unicode.IsDigit(r) {
+			flush(i)
+			start = i + 1
+			continue
+		}
+		if i > start {
+			prev := runes[i-1]
+			nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+			if unicode.IsUpper(r) && (!unicode.IsUpper(prev) || nextLower) {
+				flush(i)
+				start = i
+			}
+		}
+	}
+	flush(len(runes))
+	return parts
+}
+
+func longestCommonPrefix(a, b string) int {
+	maxLen := len(a)
+	if len(b) < maxLen {
+		maxLen = len(b)
+	}
+	count := 0
+	for i := 0; i < maxLen; i++ {
+		if a[i] != b[i] {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func jaccardTokens(a, b string) float64 {
+	A := splitIdentifier(a)
+	B := splitIdentifier(b)
+	if len(A) == 0 && len(B) == 0 {
+		return 1
+	}
+	if len(A) == 0 || len(B) == 0 {
+		return 0
+	}
+	setA := make(map[string]struct{}, len(A))
+	for _, token := range A {
+		setA[token] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(B))
+	for _, token := range B {
+		setB[token] = struct{}{}
+	}
+	intersection := 0
+	for token := range setA {
+		if _, ok := setB[token]; ok {
+			intersection++
+		}
+	}
+	union := len(setA) + len(setB) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+func jaro(s1, s2 string) float64 {
+	if s1 == s2 {
+		return 1
+	}
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	len1 := len(r1)
+	len2 := len(r2)
+	if len1 == 0 || len2 == 0 {
+		return 0
+	}
+	matchDistance := maxInt(len1, len2)/2 - 1
+	if matchDistance < 0 {
+		matchDistance = 0
+	}
+	matched1 := make([]bool, len1)
+	matched2 := make([]bool, len2)
+	matches := 0
+
+	for i := 0; i < len1; i++ {
+		start := maxInt(0, i-matchDistance)
+		end := minInt(i+matchDistance+1, len2)
+		for j := start; j < end; j++ {
+			if matched2[j] {
+				continue
+			}
+			if r1[i] != r2[j] {
+				continue
+			}
+			matched1[i] = true
+			matched2[j] = true
+			matches++
+			break
+		}
+	}
+	if matches == 0 {
+		return 0
+	}
+	k := 0
+	transpositions := 0
+	for i := 0; i < len1; i++ {
+		if !matched1[i] {
+			continue
+		}
+		for !matched2[k] {
+			k++
+		}
+		if r1[i] != r2[k] {
+			transpositions++
+		}
+		k++
+	}
+	t := float64(transpositions) / 2.0
+	return (float64(matches)/float64(len1) + float64(matches)/float64(len2) + (float64(matches)-t)/float64(matches)) / 3.0
+}
+
+func jaroWinkler(s1, s2 string) float64 {
+	jw := jaro(s1, s2)
+	common := 0
+	limit := 4
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	if len(r1) < limit {
+		limit = len(r1)
+	}
+	if len(r2) < limit {
+		limit = len(r2)
+	}
+	for i := 0; i < limit; i++ {
+		if r1[i] == r2[i] {
+			common++
+		} else {
+			break
+		}
+	}
+	return jw + float64(common)*0.1*(1-jw)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func findModuleForFile(filename string) (modPath, modRoot string) {
@@ -793,23 +1024,6 @@ func formatCandidates(candidates []suggestion) string {
 	return b.String()
 }
 
-func maxIdentifierDistance(name string) int {
-	if len(name) <= 3 {
-		return 1
-	}
-	if len(name) <= 6 {
-		return 2
-	}
-	return 3
-}
-
-func maxSelectorDistance(name string) int {
-	if len(name) <= 4 {
-		return 1
-	}
-	return 2
-}
-
 func containsString(list []string, target string) bool {
 	for _, s := range list {
 		if s == target {
@@ -817,56 +1031,4 @@ func containsString(list []string, target string) bool {
 		}
 	}
 	return false
-}
-
-func editDistance(a, b string) int {
-	ra := []rune(a)
-	rb := []rune(b)
-	m, n := len(ra), len(rb)
-
-	if m == 0 {
-		return n
-	}
-	if n == 0 {
-		return m
-	}
-
-	prev := make([]int, n+1)
-	curr := make([]int, n+1)
-
-	for j := 0; j <= n; j++ {
-		prev[j] = j
-	}
-
-	for i := 1; i <= m; i++ {
-		curr[0] = i
-		for j := 1; j <= n; j++ {
-			cost := 0
-			if ra[i-1] != rb[j-1] {
-				cost = 1
-			}
-
-			insert := curr[j-1] + 1
-			delete := prev[j] + 1
-			replace := prev[j-1] + cost
-
-			curr[j] = min3(insert, delete, replace)
-		}
-		copy(prev, curr)
-	}
-
-	return prev[n]
-}
-
-func min3(a, b, c int) int {
-	if a < b {
-		if a < c {
-			return a
-		}
-		return c
-	}
-	if b < c {
-		return b
-	}
-	return c
 }
